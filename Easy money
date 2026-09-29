@@ -1,0 +1,340 @@
+import logging
+import sqlite3
+from telegram import KeyboardButton, ReplyKeyboardMarkup, Update
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
+
+# ---------------------------------------------------------
+# ১. কনফিগারেশন (Configuration)
+# ---------------------------------------------------------
+BOT_TOKEN = "8218655059:AAHxLv43H6nhfN1DNEtyh_igDogC_dn1v8U"
+ADMIN_USERNAME = "@ASTJ10"
+DEFAULT_RECOVERY_EMAIL = "alimrantalukder8@gmail.com"
+
+RATE_PER_GMAIL = 10.0  # প্রতি জিমেইলের দাম ১০ টাকা
+MIN_WITHDRAWAL = 100.0  # সর্বনিম্ন উত্তোলন ১০০ টাকা
+REFERRAL_BONUS = 2.0  # প্রতি রেফারে ২ টাকা বোনাস
+
+# Logging সেটআপ
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
+)
+
+# ---------------------------------------------------------
+# ২. ডাটাবেস হ্যান্ডলিং (SQLite Database)
+# ---------------------------------------------------------
+DB_NAME = "gmail_bot.db"
+
+
+def init_db():
+  conn = sqlite3.connect(DB_NAME)
+  cursor = conn.cursor()
+
+  # জিমেইল জমার টেবিল
+  cursor.execute("""
+        CREATE TABLE IF NOT EXISTS gmail_submissions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            username TEXT,
+            email TEXT UNIQUE,
+            password TEXT,
+            status TEXT DEFAULT 'Pending',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+  # ইউজারের ব্যালেন্স ও রেফারাল টেবিল
+  cursor.execute("""
+        CREATE TABLE IF NOT EXISTS user_balances (
+            user_id INTEGER PRIMARY KEY,
+            balance REAL DEFAULT 0.0,
+            referred_by INTEGER DEFAULT NULL
+        )
+    """)
+
+  conn.commit()
+  conn.close()
+
+
+def add_user_and_process_referral(user_id, referrer_id=None):
+  """নতুন ইউজার যুক্ত করা এবং রেফার করা ব্যক্তিকে অটো বোনাস দেওয়া"""
+  conn = sqlite3.connect(DB_NAME)
+  cursor = conn.cursor()
+
+  cursor.execute(
+      "SELECT user_id FROM user_balances WHERE user_id = ?", (user_id,)
+  )
+  user = cursor.fetchone()
+
+  rewarded_referrer = None
+
+  if not user:
+    # নতুন ইউজারকে ডাটাবেসে যোগ করা
+    if referrer_id and str(referrer_id).isdigit() and int(referrer_id) != user_id:
+      ref_id = int(referrer_id)
+
+      # রেফারকারী আগে থেকেই ডাটাবেসে আছে কিনা দেখা
+      cursor.execute(
+          "SELECT user_id FROM user_balances WHERE user_id = ?", (ref_id,)
+      )
+      if cursor.fetchone():
+        cursor.execute(
+            "INSERT INTO user_balances (user_id, balance, referred_by) VALUES"
+            " (?, 0.0, ?)",
+            (user_id, ref_id),
+        )
+        # রেফারকারীকে বোনাস প্রদান
+        cursor.execute(
+            "UPDATE user_balances SET balance = balance + ? WHERE user_id = ?",
+            (REFERRAL_BONUS, ref_id),
+        )
+        rewarded_referrer = ref_id
+      else:
+        cursor.execute(
+            "INSERT INTO user_balances (user_id, balance) VALUES (?, 0.0)",
+            (user_id,),
+        )
+    else:
+      cursor.execute(
+          "INSERT INTO user_balances (user_id, balance) VALUES (?, 0.0)",
+          (user_id,),
+      )
+
+  conn.commit()
+  conn.close()
+  return rewarded_referrer
+
+
+def get_user_balance(user_id):
+  conn = sqlite3.connect(DB_NAME)
+  cursor = conn.cursor()
+  cursor.execute(
+      "SELECT balance FROM user_balances WHERE user_id = ?", (user_id,)
+  )
+  row = cursor.fetchone()
+  conn.close()
+  return row[0] if row else 0.0
+
+
+def get_referral_count(user_id):
+  conn = sqlite3.connect(DB_NAME)
+  cursor = conn.cursor()
+  cursor.execute(
+      "SELECT COUNT(*) FROM user_balances WHERE referred_by = ?", (user_id,)
+  )
+  count = cursor.fetchone()[0]
+  conn.close()
+  return count
+
+
+def save_submission(user_id, username, email, password):
+  try:
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute(
+        "INSERT INTO gmail_submissions (user_id, username, email, password)"
+        " VALUES (?, ?, ?, ?)",
+        (user_id, username or "NoUsername", email, password),
+    )
+    conn.commit()
+    conn.close()
+    return True, "সফলভাবে সেভ হয়েছে!"
+  except sqlite3.IntegrityError:
+    return False, "এই ইমেইলটি ইতিপূর্বে জমা দেওয়া হয়েছে!"
+  except Exception as e:
+    return False, f"ত্রুটি ঘটেছে: {str(e)}"
+
+
+# ---------------------------------------------------------
+# ৩. কাস্টম কীবোর্ড (Buttons Layout)
+# ---------------------------------------------------------
+def main_keyboard():
+  keyboard = [
+      [KeyboardButton("📝 কাজ ▶"), KeyboardButton("🗣️ ব্যালেন্স")],
+      [KeyboardButton("💰 টাকা উত্তোলন"), KeyboardButton("👤 My Referrals")],
+      [KeyboardButton("💬 সাপোর্ট"), KeyboardButton("🗣️ আমি নতুন")],
+  ]
+  return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+
+
+def withdraw_keyboard():
+  keyboard = [
+      [KeyboardButton("📱 বিকাশ (bKash)"), KeyboardButton("📱 নগদ (Nagad)")],
+      [KeyboardButton("🔙 প্রধান মেনু")],
+  ]
+  return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+
+
+# ---------------------------------------------------------
+# ৪. বট কমান্ড ও হ্যান্ডলার (Bot Handlers)
+# ---------------------------------------------------------
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+  user_id = update.effective_user.id
+  user_name = update.effective_user.first_name
+
+  # রেফারাল আইডি প্রসেসিং
+  referrer_id = context.args[0] if context.args else None
+  rewarded_referrer = add_user_and_process_referral(user_id, referrer_id)
+
+  # যিনি রেফার করেছেন তাকে নোটিফিকেশন পাঠানো
+  if rewarded_referrer:
+    try:
+      await context.bot.send_message(
+          chat_id=rewarded_referrer,
+          text=(
+              f"🎉 **নতুন রেফারাল বোনাস!**\n\n"
+              f"আপনার লিংকের মাধ্যমে একজন নতুন সদস্য যুক্ত হয়েছেন।\n"
+              f"আপনার ব্যালেন্সে **{int(REFERRAL_BONUS)} BDT** যোগ করা হয়েছে।"
+          ),
+          parse_mode="Markdown",
+      )
+    except Exception:
+      pass
+
+  welcome_text = (
+      f"👋 **হ্যালো {user_name}!**\n\n"
+      f"💰 **প্রতি জিমেইল রেট:** {int(RATE_PER_GMAIL)} টাকা\n"
+      f"🎁 **রেফার বোনাস:** {int(REFERRAL_BONUS)} টাকা\n"
+      f"🏧 **সর্বনিম্ন উত্তোলন:** {int(MIN_WITHDRAWAL)} টাকা\n\n"
+      f"📋 **জিমেইল জমা দেওয়ার নিয়ম:**\n"
+      f"১. জিমেইল খোলার সময় এই রিকভারি মেইল ব্যবহার করুন:\n"
+      f"`{DEFAULT_RECOVERY_EMAIL}`\n\n"
+      f"২. অ্যাকাউন্ট তৈরি হলে এই ফরম্যাটে পাঠান:\n"
+      f"`Email:Password`\n\n"
+      f"📌 উদাহরণ: `example@gmail.com:MyPass123`"
+  )
+  await update.message.reply_text(
+      welcome_text, parse_mode="Markdown", reply_markup=main_keyboard()
+  )
+
+
+async def handle_button_clicks(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+):
+  text = update.message.text.strip()
+  user_id = update.effective_user.id
+  bot_username = (await context.bot.get_me()).username
+
+  if text == "📝 কাজ ▶":
+    await update.message.reply_text(
+        f"📌 **কাজ শুরু করার নিয়ম:**\n\n"
+        f"💵 **প্রতি জিমেইলের দাম:** {int(RATE_PER_GMAIL)} টাকা\n"
+        f"📧 **রিকভারি ইমেইল:** `{DEFAULT_RECOVERY_EMAIL}`\n\n"
+        f"জিমেইল তৈরি করার পর এই ফরম্যাটে পাঠান:\n`Email:Password`",
+        parse_mode="Markdown",
+    )
+
+  elif text == "🗣️ ব্যালেন্স":
+    balance = get_user_balance(user_id)
+    await update.message.reply_text(
+        f"💳 **আপনার বর্তমান ব্যালেন্স:** {balance:.2f} BDT\n"
+        f"💵 **প্রতি জিমেইল রেট:** {int(RATE_PER_GMAIL)} BDT"
+    )
+
+  elif text == "💰 টাকা উত্তোলন":
+    balance = get_user_balance(user_id)
+    withdraw_msg = (
+        f"🏧 **টাকা উত্তোলন প্যানেল**\n\n"
+        f"💳 **আপনার ব্যালেন্স:** {balance:.2f} BDT\n"
+        f"⚠️ **সর্বনিম্ন উত্তোলন:** {int(MIN_WITHDRAWAL)} BDT\n\n"
+        f"আপনার উত্তোলনের মাধ্যম নির্বাচন করুন:"
+    )
+    await update.message.reply_text(withdraw_msg, reply_markup=withdraw_keyboard())
+
+  elif text in ["📱 বিকাশ (bKash)", "📱 নগদ (Nagad)"]:
+    method = "বিকাশ" if "বিকাশ" in text else "নগদ"
+    balance = get_user_balance(user_id)
+
+    if balance < MIN_WITHDRAWAL:
+      await update.message.reply_text(
+          f"❌ **উত্তোলন ব্যর্থ হয়েছে!**\n\n"
+          f"আপনার বর্তমান ব্যালেন্স: {balance:.2f} BDT\n"
+          f"পেমেন্ট নেওয়ার জন্য অন্তত {int(MIN_WITHDRAWAL)} BDT প্রয়োজন।"
+      )
+    else:
+      await update.message.reply_text(
+          f"✅ আপনার **{method}** নম্বরটি লিখে পাঠান।"
+      )
+
+  elif text == "🔙 প্রধান মেনু":
+    await update.message.reply_text(
+        "প্রধান মেনুতে ফিরে যাওয়া হয়েছে।", reply_markup=main_keyboard()
+    )
+
+  elif text == "👤 My Referrals":
+    ref_count = get_referral_count(user_id)
+    ref_link = f"https://t.me/{bot_username}?start={user_id}"
+
+    ref_msg = (
+        f"👥 **আপনার রেফারাল প্যানেল**\n\n"
+        f"📊 **মোট রেফারাল:** {ref_count} জন\n"
+        f"🎁 **প্রতি রেফার বোনাস:** {int(REFERRAL_BONUS)} টাকা\n\n"
+        f"🔗 **আপনার ব্যক্তিগত রেফারাল লিংক:**\n"
+        f"`{ref_link}`\n\n"
+        f"নিচের লিংকে ক্লিক করে অন্য বন্ধুদের বটে জয়েন করান এবং ইনস্ট্যান্ট বোনাস পান!"
+    )
+    await update.message.reply_text(ref_msg, parse_mode="Markdown")
+
+  elif text == "💬 সাপোর্ট":
+    await update.message.reply_text(
+        f"🎧 **সাপোর্ট:** যেকোনো প্রয়োজনে সরাসরি যোগাযোগ করুন: {ADMIN_USERNAME}"
+    )
+
+  elif text == "🗣️ আমি নতুন":
+    await update.message.reply_text(
+        f"❓ **নতুনদের নির্দেশিকা:**\n\n"
+        f"১. রিকভারি ইমেইল দিয়ে নতুন জিমেইল খুলুন।\n"
+        f"২. বটের ভেতরে `Email:Password` আকারে পাঠান।\n"
+        f"৩. প্রতিটি জিমেইলের জন্য পাবেন {int(RATE_PER_GMAIL)} টাকা।\n"
+        f"৪. বন্ধুদের ইনভাইট করে রেফার বোনাস আয় করুন।\n"
+        f"৫. ১০০ টাকা হলেই বিকাশ বা নগদে টাকা তুলতে পারবেন।"
+    )
+
+  elif ":" in text and len(text.split(":")) == 2:
+    email, password = text.split(":")
+    email = email.strip()
+    password = password.strip()
+
+    username = update.effective_user.username
+    success, msg = save_submission(user_id, username, email, password)
+
+    if success:
+      response = (
+          f"✅ **আপনার জিমেইল গ্রহণ করা হয়েছে!**\n\n"
+          f"📧 **ইমেইল:** `{email}`\n"
+          f"🔐 **পাসওয়ার্ড:** `{password}`\n"
+          f"💵 **রেট:** {int(RATE_PER_GMAIL)} BDT\n"
+          f"⏳ **স্ট্যাটাস:** ভেরিফিকেশনের জন্য ওয়েটিংয়ে আছে।"
+      )
+    else:
+      response = f"❌ **ব্যর্থ হয়েছে:** {msg}"
+
+    await update.message.reply_text(
+        response, parse_mode="Markdown", reply_markup=main_keyboard()
+    )
+
+  else:
+    await update.message.reply_text(
+        "⚠️ **অনুরোধ বুঝা যায়নি!**\n\n"
+        "নিচের বাটন ব্যবহার করুন অথবা `Email:Password` ফরম্যাটে জিমেইল জমা দিন।",
+        reply_markup=main_keyboard(),
+    )
+
+
+if __name__ == "__main__":
+  init_db()
+  app = ApplicationBuilder().token(BOT_TOKEN).build()
+
+  app.add_handler(CommandHandler("start", start))
+  app.add_handler(
+      MessageHandler(filters.TEXT & ~filters.COMMAND, handle_button_clicks)
+  )
+
+  print("🤖 Telegram Bot is Running with Automated Referral Bonuses...")
+  app.run_polling()
